@@ -8,6 +8,7 @@ import { AnalyzerModule } from './analyzer/analyzer.module';
 import { AIModule } from './ai/ai.module';
 import { FixerModule } from './fixer/fixer.module';
 import { HistoryModule } from './history/history.module';
+import { AssessmentsModule } from './assessments/assessments.module';
 import { HealthController } from './health.controller';
 
 @Module({
@@ -21,6 +22,7 @@ import { HealthController } from './health.controller';
     AIModule,
     FixerModule,
     HistoryModule,
+    AssessmentsModule,
   ],
   controllers: [HealthController],
 })

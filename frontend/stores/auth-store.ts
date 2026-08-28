@@ -27,7 +27,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       set({ isLoading: true });
       const user = await apiClient<User>('/users/me');
-      set({ user, isAuthenticated: true, isLoading: false });
+      set({ user, isAuthenticated: Boolean(user), isLoading: false });
     } catch {
       set({ user: null, isAuthenticated: false, isLoading: false });
     }
@@ -35,7 +35,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   logout: async () => {
     try {
-      await apiClient('/auth/logout', { method: 'POST' });
+      await apiClient('/auth/logout', { method: 'POST', body: JSON.stringify({}) });
     } catch {
       // Ignore logout API errors
     } finally {

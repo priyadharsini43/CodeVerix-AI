@@ -54,6 +54,18 @@ const DEFAULT_CODE_SAMPLES: Record<string, string> = {
   TypeScript: `function calculateAverage(numbers: number[]): number {\n  const total = numbers.reduce((acc, curr) => acc + curr, 0);\n  return total / numbers.length;\n}\n\nconsole.log(calculateAverage([]));`,
 };
 
+const normalizeLanguage = (lang?: string): string => {
+  if (!lang) return 'Python';
+  const l = lang.trim().toLowerCase();
+  if (l === 'python' || l === 'py') return 'Python';
+  if (l === 'java') return 'Java';
+  if (l === 'c') return 'C';
+  if (l === 'cpp' || l === 'c++') return 'C++';
+  if (l === 'javascript' || l === 'js') return 'JavaScript';
+  if (l === 'typescript' || l === 'ts') return 'TypeScript';
+  return lang;
+};
+
 export default function WorkspacePage() {
   const params = useParams();
   const router = useRouter();
@@ -83,8 +95,9 @@ export default function WorkspacePage() {
       setErrorMsg(null);
       const data = await apiClient<Project>(`/projects/${projectId}`);
       setProject(data);
-      setSelectedLanguage(data.defaultLanguage);
-      setSourceCode(DEFAULT_CODE_SAMPLES[data.defaultLanguage] || DEFAULT_CODE_SAMPLES['Python']);
+      const initialLang = normalizeLanguage(data.defaultLanguage);
+      setSelectedLanguage(initialLang);
+      setSourceCode(DEFAULT_CODE_SAMPLES[initialLang] || DEFAULT_CODE_SAMPLES['Python']);
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to load project.');
     } finally {
@@ -93,9 +106,10 @@ export default function WorkspacePage() {
   };
 
   const handleLanguageChange = (newLang: string) => {
-    setSelectedLanguage(newLang);
+    const normalized = normalizeLanguage(newLang);
+    setSelectedLanguage(normalized);
     if (!sourceCode || Object.values(DEFAULT_CODE_SAMPLES).includes(sourceCode)) {
-      setSourceCode(DEFAULT_CODE_SAMPLES[newLang] || '');
+      setSourceCode(DEFAULT_CODE_SAMPLES[normalized] || '');
     }
   };
 
@@ -119,7 +133,7 @@ export default function WorkspacePage() {
         method: 'POST',
         body: JSON.stringify({
           projectId,
-          language: selectedLanguage,
+          language: normalizeLanguage(selectedLanguage),
           sourceCode,
         }),
       });
@@ -141,19 +155,23 @@ export default function WorkspacePage() {
     try {
       setIsPrompting(true);
       setErrorMsg(null);
+      setAnalysisResult(null);
+      setShowDiffView(false);
+      const currentLang = normalizeLanguage(selectedLanguage);
       const response = await apiClient<any>('/submissions/prompt', {
         method: 'POST',
         body: JSON.stringify({
           projectId,
-          language: selectedLanguage,
+          language: currentLang,
           sourceCode,
           prompt: promptText
         }),
       });
 
       // Update UI with prompt response
-      if (response.intent === 'convert') {
-        setSelectedLanguage(response.language);
+      if (response.intent === 'convert' && response.language) {
+        const convertedLang = normalizeLanguage(response.language);
+        setSelectedLanguage(convertedLang);
       }
 
       setAnalysisResult({

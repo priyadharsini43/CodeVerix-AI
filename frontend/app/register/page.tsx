@@ -7,7 +7,7 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useAuthStore } from '../../stores/auth-store';
-import { apiClient, ApiError } from '../../lib/api-client';
+import { apiClient } from '../../lib/api-client';
 import { Code2, UserPlus, AlertCircle, Loader2 } from 'lucide-react';
 import { User } from '../../types';
 
@@ -46,11 +46,8 @@ export default function RegisterPage() {
       setUser(response.user);
       router.push('/dashboard');
     } catch (err: any) {
-      if (err instanceof ApiError) {
-        setErrorMsg(err.message);
-      } else {
-        setErrorMsg('Registration failed. Please try again.');
-      }
+      const msg = err?.message || 'Registration failed. Please try again.';
+      setErrorMsg(typeof msg === 'string' ? msg : JSON.stringify(msg));
     } finally {
       setIsSubmitting(false);
     }

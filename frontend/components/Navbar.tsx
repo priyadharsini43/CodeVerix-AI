@@ -68,6 +68,17 @@ export function Navbar() {
                 <span>History</span>
               </Link>
               <Link
+                href="/assessments"
+                className={`flex items-center space-x-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                  pathname.startsWith('/assessments')
+                    ? 'bg-slate-800 text-blue-400'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                }`}
+              >
+                <Code2 className="w-4 h-4" />
+                <span>Practice</span>
+              </Link>
+              <Link
                 href="/settings"
                 className={`flex items-center space-x-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
                   pathname === '/settings'

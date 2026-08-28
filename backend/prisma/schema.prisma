@@ -8,13 +8,14 @@ generator client {
 }
 
 model User {
-  id           String    @id @default(uuid())
-  name         String
-  email        String    @unique
-  passwordHash String
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  projects     Project[]
+  id                    String                 @id @default(uuid())
+  name                  String
+  email                 String                 @unique
+  passwordHash          String
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+  projects              Project[]
+  assessmentSubmissions AssessmentSubmission[]
 }
 
 model Project {
@@ -54,4 +55,72 @@ model Analysis {
   confidence   Float
   createdAt    DateTime   @default(now())
   submission   Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+}
+
+model Assessment {
+  id               String                 @id @default(uuid())
+  title            String
+  description      String                 @db.Text
+  difficulty       String                 // "Easy" | "Medium" | "Hard"
+  subject          String                 // e.g. "Programming"
+  topic            String                 // e.g. "Arrays"
+  questionType     String                 @default("Single File Programming")
+  totalMarks       Int                    @default(100)
+  allowedLanguages String                 @default("Java")
+  starterCode      Json?                  // Record<string, string> e.g. { "Java": "..." }
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+  testCases        TestCase[]
+  submissions      AssessmentSubmission[]
+}
+
+model TestCase {
+  id             String           @id @default(uuid())
+  assessmentId   String
+  input          String           @db.Text
+  expectedOutput String           @db.Text
+  isHidden       Boolean          @default(false)
+  marks          Int              @default(10)
+  createdAt      DateTime         @default(now())
+  assessment     Assessment       @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  results        TestCaseResult[]
+
+  @@index([assessmentId])
+}
+
+model AssessmentSubmission {
+  id              String           @id @default(uuid())
+  assessmentId    String
+  userId          String
+  language        String
+  sourceCode      String           @db.Text
+  status          String           // "Accepted" | "Wrong Answer" | "Compilation Error" | "Runtime Error" | "Time Limit Exceeded"
+  score           Int              @default(0)
+  passedTests     Int              @default(0)
+  totalTests      Int              @default(0)
+  executionTime   Int              @default(0) // in ms
+  compilerMessage String?          @db.Text
+  createdAt       DateTime         @default(now())
+  assessment      Assessment       @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  testCaseResults TestCaseResult[]
+
+  @@index([assessmentId])
+  @@index([userId])
+}
+
+model TestCaseResult {
+  id            String               @id @default(uuid())
+  submissionId  String
+  testCaseId    String
+  status        String               // "Passed" | "Failed" | "Error" | "Time Limit Exceeded"
+  actualOutput  String?              @db.Text
+  executionTime Int                  @default(0) // in ms
+  errorMessage  String?              @db.Text
+  createdAt     DateTime             @default(now())
+  submission    AssessmentSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  testCase      TestCase             @relation(fields: [testCaseId], references: [id], onDelete: Cascade)
+
+  @@index([submissionId])
+  @@index([testCaseId])
 }

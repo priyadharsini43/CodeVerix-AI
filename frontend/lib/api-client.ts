@@ -15,9 +15,12 @@ export async function apiClient<T>(
 ): Promise<T> {
   const url = endpoint.startsWith('http') ? endpoint : `${API_BASE_URL}/api${endpoint}`;
 
-  const defaultHeaders: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
+  const defaultHeaders: Record<string, string> = {};
+
+  // Only set Content-Type if a body is present or explicitly specified
+  if (options.body) {
+    defaultHeaders['Content-Type'] = 'application/json';
+  }
 
   const response = await fetch(url, {
     ...options,
@@ -31,7 +34,12 @@ export async function apiClient<T>(
   const responseData = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    const message = responseData?.message || responseData?.error || 'An unexpected error occurred';
+    let message = responseData?.message || responseData?.error || 'An unexpected error occurred';
+    if (Array.isArray(message)) {
+      message = message.join(', ');
+    } else if (typeof message === 'object' && message !== null) {
+      message = JSON.stringify(message);
+    }
     throw new ApiError(message, response.status);
   }
 

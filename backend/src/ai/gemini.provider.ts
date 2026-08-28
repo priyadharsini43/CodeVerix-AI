@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { GoogleGenAI } from '@google/genai';
 import { z } from 'zod';
 import { AIProvider, AnalysisResult, PromptResult } from './ai-provider.interface';
@@ -959,6 +959,16 @@ ${params.sourceCode}
     const message = (error.message || '').toLowerCase();
     const statusStr = (error.status || '').toString().toLowerCase();
 
+    if (
+      statusCode === 400 ||
+      statusCode === '400' ||
+      message.includes('api_key_invalid') ||
+      message.includes('api key not valid') ||
+      message.includes('invalid_argument')
+    ) {
+      return false;
+    }
+
     const temporaryCodes = [
       429, 503, 408, 500, 502, 504,
       '429', '503', '408', '500', '502', '504',
@@ -1574,13 +1584,16 @@ ${params.sourceCode}
     language: string;
     sourceCode?: string;
   }): Promise<PromptResult> {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey || apiKey.trim() === '' || apiKey === 'your-gemini-api-key') {
-      throw new Error('GEMINI_API_KEY is not configured in backend environment');
+    const rawApiKey = process.env.GEMINI_API_KEY;
+    const apiKey = rawApiKey ? rawApiKey.trim().replace(/^["']|["']$/g, '') : '';
+    if (!apiKey || apiKey === 'your-gemini-api-key') {
+      throw new BadRequestException('GEMINI_API_KEY is not configured in backend environment.');
     }
 
     const ai = new GoogleGenAI({ apiKey });
-    const primaryModel = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.6-flash';
+    const primaryModel = (process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.6-flash')
+      .trim()
+      .replace(/^["']|["']$/g, '');
 
     const systemPrompt = `
 You are the CodeVerix AI coding assistant.
@@ -1612,7 +1625,15 @@ User Prompt: ${params.prompt}
 ${params.sourceCode ? `\nSource Code:\n${params.sourceCode}` : ''}
 `;
 
-    const result = await this.generateWithRetry(ai, primaryModel, userPrompt, systemPrompt, 3);
+    let result: { text: string; modelUsed: string };
+    try {
+      result = await this.generateWithRetry(ai, primaryModel, userPrompt, systemPrompt, 3);
+    } catch (err: any) {
+      const errMsg = err?.message || 'Unknown error during AI request processing.';
+      this.logger.error(`[processPrompt Failure] ${errMsg}`, err.stack);
+      throw new BadRequestException(`AI Prompt Error: ${errMsg}`);
+    }
+
     const cleanedText = result.text.trim().replace(/^\s*```(json)?/i, '').replace(/```\s*$/i, '').trim();
 
     try {
@@ -1621,7 +1642,7 @@ ${params.sourceCode ? `\nSource Code:\n${params.sourceCode}` : ''}
       return parsed as PromptResult;
     } catch (err: any) {
       this.logger.error(`Failed to parse PromptResult: ${err.message}\nRaw JSON: ${cleanedText}`);
-      throw new Error('Invalid JSON response from AI.');
+      throw new BadRequestException('Invalid JSON response returned from AI service.');
     }
   }
 }

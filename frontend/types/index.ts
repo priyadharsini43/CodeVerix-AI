@@ -61,3 +61,76 @@ export interface DashboardStats {
   submissionsCount: number;
   aiFixesCount: number;
 }
+
+// Assessment Platform Types
+export interface TestCase {
+  id: string;
+  testCaseNumber: number;
+  isHidden: boolean;
+  marks: number;
+  input?: string | null;
+  expectedOutput?: string | null;
+}
+
+export interface Assessment {
+  id: string;
+  title: string;
+  description: string;
+  difficulty: string;
+  subject: string;
+  topic: string;
+  questionType: string;
+  totalMarks: number;
+  allowedLanguages: string;
+  starterCode?: Record<string, string> | null;
+  createdAt: string;
+  timesSubmitted?: number;
+  totalTestCases?: number;
+  submissionCount?: number;
+  status?: string;
+  testCases?: TestCase[];
+  recentSubmissions?: AssessmentSubmission[];
+}
+
+export interface TestCaseExecutionResult {
+  testCaseNumber: number;
+  testCaseId: string;
+  status: 'Passed' | 'Failed' | 'Error' | 'Time Limit Exceeded';
+  isHidden?: boolean;
+  input?: string | null;
+  expectedOutput?: string | null;
+  actualOutput?: string | null;
+  executionTime: number;
+  message: string;
+}
+
+export interface AssessmentSubmissionReport {
+  submissionId?: string;
+  assessmentId?: string;
+  status: 'Accepted' | 'Wrong Answer' | 'Compilation Error' | 'Runtime Error' | 'Time Limit Exceeded';
+  score?: number;
+  totalMarks?: number;
+  passedTests: number;
+  totalTests: number;
+  executionTime?: number;
+  compilerMessage: string | null;
+  timesSubmitted?: number;
+  timesCompiled?: number;
+  createdAt?: string;
+  results: TestCaseExecutionResult[];
+}
+
+export interface AssessmentSubmission {
+  id: string;
+  assessmentId: string;
+  userId: string;
+  language: string;
+  sourceCode: string;
+  status: string;
+  score: number;
+  passedTests: number;
+  totalTests: number;
+  executionTime: number;
+  compilerMessage?: string | null;
+  createdAt: string;
+}
