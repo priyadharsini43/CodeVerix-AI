@@ -32,5 +32,5 @@ RUN npm run build
 # Expose port (Render automatically sets PORT env var)
 EXPOSE 3001
 
-# Start compiled NestJS server
-CMD ["node", "dist/src/main.js"]
+# Run Prisma production migrations before starting NestJS server
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/src/main.js"]
