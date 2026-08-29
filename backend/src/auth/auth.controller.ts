@@ -14,12 +14,13 @@ export class AuthController {
     @Res({ passthrough: true }) response: FastifyReply,
   ) {
     const result = await this.authService.register(registerDto);
-    
+    const isProd = process.env.NODE_ENV === 'production';
+
     // Set HTTP-Only Cookie for secure auth
     response.setCookie('access_token', result.token, {
       httpOnly: true,
-      secure: false, // Set true in production with HTTPS
-      sameSite: 'lax',
+      secure: isProd,
+      sameSite: isProd ? 'none' : 'lax',
       path: '/',
       maxAge: 7 * 24 * 60 * 60, // 7 days in seconds
     });
@@ -38,12 +39,13 @@ export class AuthController {
     @Res({ passthrough: true }) response: FastifyReply,
   ) {
     const result = await this.authService.login(loginDto);
+    const isProd = process.env.NODE_ENV === 'production';
 
     // Set HTTP-Only Cookie for secure auth
     response.setCookie('access_token', result.token, {
       httpOnly: true,
-      secure: false, // Set true in production with HTTPS
-      sameSite: 'lax',
+      secure: isProd,
+      sameSite: isProd ? 'none' : 'lax',
       path: '/',
       maxAge: 7 * 24 * 60 * 60, // 7 days in seconds
     });

@@ -9,6 +9,11 @@ import { TransformInterceptor } from './common/interceptors/transform.intercepto
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
+
+  if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET must be set in production');
+  }
+
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({ logger: false }),
@@ -20,8 +25,10 @@ async function bootstrap() {
   });
 
   // Configure CORS
+  const allowedOrigin = process.env.FRONTEND_URL || 'http://localhost:3000';
+
   await app.register(fastifyCors, {
-    origin: true,
+    origin: process.env.NODE_ENV === 'production' ? allowedOrigin : true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Cookie', 'Accept'],

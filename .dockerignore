@@ -1,0 +1,13 @@
+node_modules
+frontend/node_modules
+frontend/.next
+backend/node_modules
+backend/dist
+.git
+.gitignore
+scratch
+backend/scratch
+*.log
+*.tsbuildinfo
+.env
+.env.local
