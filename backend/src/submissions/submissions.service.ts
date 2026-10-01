@@ -4,6 +4,7 @@ import { AnalyzerService } from '../analyzer/analyzer.service';
 import { ProjectsService } from '../projects/projects.service';
 import { AnalyzeSubmissionDto } from './dto/analyze-submission.dto';
 import { UniversalPromptDto } from './dto/universal-prompt.dto';
+import { ConvertCodeDto } from './dto/convert-code.dto';
 
 @Injectable()
 export class SubmissionsService {
@@ -39,7 +40,7 @@ export class SubmissionsService {
         status: aiResult.status,
         bugs: aiResult.bugs as any,
         explanation: aiResult.explanation,
-        fixedCode: aiResult.fixedCode ?? null,
+        fixedCode: aiResult.fixedCode ?? aiResult.correctedCode ?? null,
         complexity: aiResult.complexity ? (aiResult.complexity as any) : null,
         confidence: aiResult.confidence,
       },
@@ -55,13 +56,27 @@ export class SubmissionsService {
         id: analysis.id,
         status: analysis.status,
         bugs: analysis.bugs,
+        issues: aiResult.issues || analysis.bugs,
         explanation: analysis.explanation,
         fixedCode: analysis.fixedCode,
+        correctedCode: analysis.fixedCode,
         complexity: analysis.complexity,
         confidence: analysis.confidence,
         createdAt: analysis.createdAt,
       },
     };
+  }
+
+  async convertCode(userId: string, dto: ConvertCodeDto) {
+    // 1. Verify project ownership
+    await this.projectsService.findOneForUser(userId, dto.projectId);
+
+    // 2. Run conversion pipeline
+    return this.analyzerService.convertCode(
+      dto.sourceLanguage,
+      dto.targetLanguage,
+      dto.sourceCode,
+    );
   }
 
   async getSubmissionsForUser(userId: string, projectId?: string) {

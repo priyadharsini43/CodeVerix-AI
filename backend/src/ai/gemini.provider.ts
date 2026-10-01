@@ -1,22 +1,32 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { GoogleGenAI } from '@google/genai';
 import { z } from 'zod';
-import { AIProvider, AnalysisResult, PromptResult } from './ai-provider.interface';
+import {
+  AIProvider,
+  AnalysisResult,
+  ConversionResult,
+  PromptResult,
+  BugDetail,
+  AnalysisIssue,
+} from './ai-provider.interface';
 
 /**
- * Allowed bug categories used by the frontend.
- *
- * IMPORTANT:
- * Keep these categories language-independent.
- * For example:
- * - C array out-of-bounds -> runtime
- * - C division by zero -> runtime
- * - Python ZeroDivisionError -> runtime
- * - TypeScript wrong type -> type
+ * Utility function to strip accidental markdown fences from code fields
  */
+export function cleanCodeFence(code: string | null | undefined): string | null {
+  if (!code || typeof code !== 'string') return null;
+  let trimmed = code.trim();
+  if (trimmed.startsWith('```')) {
+    trimmed = trimmed
+      .replace(/^```[a-zA-Z0-9_-]*\n?/, '')
+      .replace(/\n?```$/, '')
+      .trim();
+  }
+  return trimmed || null;
+}
+
 const BugSchema = z.object({
   line: z.number().nullable().optional(),
-
   type: z.enum([
     'syntax',
     'runtime',
@@ -25,17 +35,11 @@ const BugSchema = z.object({
     'performance',
     'security',
   ]),
-
   severity: z.enum(['high', 'medium', 'low']),
-
   message: z.string(),
-
   explanation: z.string(),
 });
 
-/**
- * Complexity can be null when it cannot be determined.
- */
 const ComplexitySchema = z
   .object({
     time: z.string().optional(),
@@ -44,37 +48,48 @@ const ComplexitySchema = z
   .nullable()
   .optional();
 
-/**
- * Main AI response schema.
- */
 const AnalysisResultSchema = z.object({
   language: z.string(),
-
-  status: z.enum([
-    'bug_found',
-    'no_bug_found',
-    'analysis_failed',
-  ]),
-
+  status: z.enum(['bug_found', 'no_bug_found', 'analysis_failed']),
   bugs: z.array(BugSchema),
-
   fixedCode: z.string().nullable().optional(),
-
   explanation: z.string(),
-
   complexity: ComplexitySchema,
-
   confidence: z.number(),
 });
 
+const ConversionResultSchema = z.object({
+  success: z.boolean(),
+  sourceLanguage: z.string(),
+  targetLanguage: z.string(),
+  convertedCode: z.string(),
+  explanation: z.string(),
+  notes: z.array(z.string()).optional(),
+  warnings: z.array(z.string()).optional(),
+});
+
 const PromptResultSchema = z.object({
-  intent: z.enum(['solve', 'fix', 'explain', 'optimize', 'convert', 'generate_tests', 'debug', 'review']),
+  intent: z.enum([
+    'solve',
+    'fix',
+    'explain',
+    'optimize',
+    'convert',
+    'generate_tests',
+    'debug',
+    'review',
+  ]),
   language: z.string(),
+  sourceLanguage: z.string().optional(),
+  targetLanguage: z.string().optional(),
   problemExplanation: z.string().optional(),
   solution: z.string().optional(),
+  convertedCode: z.string().optional(),
+  explanation: z.string().optional(),
   complexity: ComplexitySchema,
   testCases: z.array(z.any()).optional(),
   warnings: z.array(z.string()).optional(),
+  notes: z.array(z.string()).optional(),
   learningExplanation: z.string().optional(),
 });
 
@@ -86,22 +101,11 @@ export class GeminiProvider implements AIProvider {
     language: string;
     sourceCode: string;
   }): Promise<AnalysisResult> {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const rawApiKey = process.env.GEMINI_API_KEY;
+    const apiKey = rawApiKey ? rawApiKey.trim().replace(/^["']|["']$/g, '') : '';
 
-    /**
-     * ------------------------------------------------------------
-     * 1. Check Gemini API key
-     * ------------------------------------------------------------
-     */
-    if (
-      !apiKey ||
-      apiKey.trim() === '' ||
-      apiKey === 'your-gemini-api-key'
-    ) {
-      this.logger.warn(
-        'GEMINI_API_KEY is not configured in backend environment',
-      );
-
+    if (!apiKey || apiKey === 'your-gemini-api-key') {
+      this.logger.warn('GEMINI_API_KEY is not configured in backend environment');
       return {
         language: params.language,
         status: 'analysis_failed',
@@ -114,701 +118,135 @@ export class GeminiProvider implements AIProvider {
       };
     }
 
-    /**
-     * ------------------------------------------------------------
-     * 2. Validate source code
-     * ------------------------------------------------------------
-     */
     if (!params.sourceCode || params.sourceCode.trim() === '') {
       return {
         language: params.language,
         status: 'analysis_failed',
         bugs: [],
         fixedCode: null,
-        explanation:
-          'No source code was provided for analysis.',
+        explanation: 'No source code was provided for analysis.',
         complexity: null,
         confidence: 0,
       };
     }
 
     try {
-      /**
-       * ----------------------------------------------------------
-       * 3. Initialize Gemini
-       * ----------------------------------------------------------
-       */
-      const ai = new GoogleGenAI({
-        apiKey,
-      });
+      const ai = new GoogleGenAI({ apiKey });
 
-      /**
-       * ----------------------------------------------------------
-       * 4. Strong system prompt
-       * ----------------------------------------------------------
-       *
-       * The important part here is that Gemini MUST use only
-       * the six frontend-supported bug categories.
-       */
       const systemPrompt = `
-You are an expert software debugging assistant for CodeVerix AI.
+You are a compiler-aware senior software engineer analyzing code for CodeVerix AI.
+Analyze the supplied code as a compiler-aware senior engineer. Identify concrete syntax, type, runtime, and logical problems. Return corrected code that preserves the intended behavior. Do not invent missing requirements.
 
-Your job is to analyze the user's submitted source code accurately and, when real bugs exist, generate a CORRECTED VERSION of the user's code.
-
-IMPORTANT: The submitted language is exactly:
-
-"${params.language}"
+SUBMITTED LANGUAGE: "${params.language}"
 
 ==================================================
-
-1. BUG DETECTION RULES
-   ==================================================
+1. BUG DETECTION & ANALYSIS RULES
+==================================================
 
 Analyze the ENTIRE submitted source code.
+Detect REAL bugs only. Do NOT report code style, formatting, naming preferences, or theoretical problems.
 
-Detect REAL bugs only.
+Supported bug categories MUST be one of:
+"syntax" | "runtime" | "logical" | "type" | "performance" | "security"
 
-Do NOT invent bugs.
+Severity MUST be one of: "high" | "medium" | "low"
 
-Do NOT report:
-
-* stylistic preferences
-* formatting preferences
-* naming preferences
-* optional refactoring
-* code that is merely unconventional
-* theoretical problems that cannot occur from the submitted code
-
-Supported bug types MUST be exactly:
-
-"syntax"
-"runtime"
-"logical"
-"type"
-"performance"
-"security"
-
-Severity MUST be exactly:
-
-"high"
-"medium"
-"low"
-
-If one or more real bugs are found:
-
+If one or more real bugs exist:
 "status": "bug_found"
 
-If the submitted code is correct:
-
+If the code is correct:
 "status": "no_bug_found"
 
-Only use:
-
-"status": "analysis_failed"
-
-when the code genuinely cannot be analyzed.
+"fixedCode" MUST contain the complete, corrected source code in "${params.language}".
+Do NOT wrap fixedCode inside markdown backticks.
 
 ==================================================
-2. ANALYZE THE ACTUAL SOURCE CODE
-=================================
-
-Base every finding ONLY on the source code provided by the user.
-
-Do not assume missing code.
-
-Do not invent variables, functions, inputs, outputs, libraries, or requirements.
-
-Understand the program's apparent purpose before deciding that something is a bug.
-
-Trace:
-
-* variable values
-* conditions
-* loops
-* array indexes
-* string operations
-* function calls
-* return values
-* recursion
-* null/undefined values
-* arithmetic operations
-* collection access
-* type compatibility
-
-Check the COMPLETE program before generating the result.
-
+2. STRICT JSON OUTPUT FORMAT
 ==================================================
-3. BUG TYPE CLASSIFICATION
-==========================
 
-Use only these categories.
-
-"syntax":
-The source code cannot be parsed or compiled because of invalid language syntax.
-
-"runtime":
-The code can compile/run but can fail during execution.
-
-Examples:
-
-* array index out of bounds
-* null pointer dereference
-* division by zero
-* invalid collection access
-* infinite recursion
-* invalid memory access
-* unhandled runtime exception
-
-"logical":
-The program runs but produces an incorrect result because the algorithm or condition is wrong.
-
-"type":
-A type mismatch or invalid type operation causes a real problem.
-
-"performance":
-The program is functionally correct but has a significant avoidable performance problem.
-
-"security":
-The code contains a real security vulnerability.
-
-Never create a new bug category.
-
-==================================================
-4. LINE NUMBER RULE
-===================
-
-For every bug, report the actual source-code line where the bug occurs.
-
-Use 1-based line numbering.
-
-If the exact line cannot be determined reliably, use:
-
-"line": null
-
-Never invent a line number.
-
-==================================================
-5. FIXED CODE REQUIREMENTS
-==========================
-
-If bugs are found:
-
-"fixedCode" MUST contain the COMPLETE corrected source code.
-
-The fixedCode MUST:
-
-1. Use the SAME programming language as the submitted code.
-2. Preserve the original program's purpose.
-3. Preserve existing functionality that is unrelated to the bug.
-4. Fix ALL bugs reported in the "bugs" array.
-5. Not introduce new syntax errors.
-6. Not introduce new runtime errors.
-7. Not introduce new logical errors.
-8. Not remove required functionality.
-9. Not replace the program with an unrelated solution.
-10. Include required imports/includes.
-11. Be directly compilable/executable whenever possible.
-12. Make the SMALLEST reliable changes necessary.
-
-Do NOT rewrite correct code unnecessarily.
-
-==================================================
-6. FIXED CODE VERIFICATION
-==========================
-
-CRITICAL:
-
-Before returning fixedCode, perform a SECOND internal verification of the ENTIRE corrected program.
-
-Check:
-
-* syntax
-* variable declarations
-* variable usage
-* imports/includes
-* brackets
-* braces
-* parentheses
-* semicolons
-* operators
-* method/function names
-* method calls
-* array access
-* collection access
-* string operations
-* null handling
-* undefined values
-* loops
-* loop boundaries
-* conditions
-* return statements
-* type compatibility
-* recursion base cases
-* arithmetic operations
-* division operations
-* input handling
-* output behavior
-
-Then verify that:
-
-1. Every reported bug is actually fixed.
-2. The fixed code still performs the original task.
-3. The fix did not create a different bug.
-4. The fixed code is internally consistent.
-
-If you discover a problem during this verification, FIX IT before returning the JSON.
-
-==================================================
-7. JAVA-SPECIFIC SAFETY RULES
-=============================
-
-When the submitted language is Java, follow these rules strictly.
-
-Java arrays use:
-
-array.length
-
-Java Strings use:
-
-string.length()
-
-Correct:
-
-for (int i = 0; i < array.length; i++)
-
-Correct:
-
-for (int i = 0; i < string.length(); i++)
-
-Incorrect:
-
-string.length
-
-Incorrect:
-
-array.length()
-
-Never confuse arrays and Strings.
-
-For multiple conditions, use:
-
-||
-
-or
-
-&&
-
-Correct:
-
-if (current == '(' || current == '[' || current == '{')
-
-Incorrect:
-
-if (current == '(', current == '[', current == '{')
-
-For null-safe String comparison prefer:
-
-"PASS".equals(result)
-
-instead of:
-
-result.equals("PASS")
-
-Array indexes are valid from:
-
-0
-
-through:
-
-array.length - 1
-
-Therefore:
-
-i < array.length
-
-is normally correct.
-
-Avoid:
-
-i <= array.length
-
-Do NOT access:
-
-array[array.length]
-
-For recursion, ensure the base case occurs before invalid array access.
-
-Example:
-
-if (index >= arr.length) {
-return 0;
-}
-
-Never intentionally generate division by zero.
-
-==================================================
-8. LOGICAL FIX VALIDATION
-=========================
-
-Fixing a runtime exception is NOT necessarily the complete fix.
-
-Example:
-
-Original:
-
-String topper = null;
-
-if (topper.equals("Priya")) {
-System.out.println("Topper found");
-}
-
-Changing only the comparison to:
-
-if ("Priya".equals(topper)) {
-System.out.println("Topper found");
-}
-
-may remove the NullPointerException, but it does not automatically prove that the program's intended logic is correct.
-
-Therefore:
-
-Do not merely silence exceptions.
-
-Understand WHY the invalid value exists and preserve the intended behavior.
-
-If the submitted code has an uninitialized, invalid, or incorrectly calculated value, correct the underlying logic when it is clear from the source code.
-
-==================================================
-9. COMMON OFF-BY-ONE ERRORS
-===========================
-
-For arrays and collections, carefully check loop boundaries.
-
-Example:
-
-for (int i = 0; i <= arr.length; i++)
-
-is usually incorrect because arr[arr.length] is invalid.
-
-Correct:
-
-for (int i = 0; i < arr.length; i++)
-
-Do not change a boundary unless the original code actually has an indexing problem.
-
-==================================================
-10. DIVISION BY ZERO
-====================
-
-Detect real division-by-zero risks.
-
-Do not simply remove the calculation.
-
-Preserve the intended behavior.
-
-If the divisor can be zero, safely handle the zero case according to the apparent purpose of the program.
-
-Do not introduce arbitrary behavior without evidence from the source code.
-
-==================================================
-11. RECURSION SAFETY
-====================
-
-For recursive functions verify:
-
-* base case exists
-* base case is reachable
-* recursive call progresses toward the base case
-* array/string indexes remain valid
-* recursion does not continue indefinitely
-
-Do not fix recursion by simply deleting the recursive functionality.
-
-==================================================
-12. PRESERVE PROGRAM INTENT
-===========================
-
-The goal is:
-
-SMALLEST CORRECT FIX.
-
-Do not rewrite an entire program when a small correction is enough.
-
-Examples:
-
-If Java has:
-
-i <= array.length
-
-and the intended loop is normal array traversal:
-
-change it to:
-
-i < array.length
-
-If Java has:
-
-string.length
-
-change it to:
-
-string.length()
-
-If a condition incorrectly uses comma-separated comparisons:
-
-replace it with the correct logical operator.
-
-If a divisor may be zero:
-
-guard the operation while preserving the intended calculation.
-
-==================================================
-13. NO-BUG DECISION
-===================
-
-Do not report a bug simply because code could be improved.
-
-If the program is valid and its logic is correct:
-
-"status": "no_bug_found"
-
-"bugs": []
-
-"fixedCode": null
-
-Do not generate unnecessary fixes.
-
-==================================================
-14. COMPLEXITY
-==============
-
-Estimate time and space complexity based on the actual submitted algorithm.
-
-Do NOT guess.
-
-If complexity can be determined:
-
-"complexity": {
-"time": "O(n)",
-"space": "O(1)"
-}
-
-If it genuinely cannot be determined:
-
-"complexity": null
-
-==================================================
-15. CONFIDENCE
-==============
-
-Return a number between 0 and 1.
-
-Confidence should represent how certain you are about the analysis.
-
-Do not always return 0.98.
-
-Use lower confidence when:
-
-* requirements are ambiguous
-* program intent is unclear
-* the exact behavior depends on missing external code
-* the bug cannot be determined reliably
-
-==================================================
-16. STRICT JSON OUTPUT
-======================
-
-Return ONLY ONE valid JSON object.
-
-Do NOT return Markdown.
-
-Do NOT use triple backticks.
-
-Do NOT add explanations outside the JSON.
-
-Do NOT add text before the JSON.
-
-Do NOT add text after the JSON.
-
-Do NOT add trailing commas.
-
-The response MUST be directly parseable by:
-
-JSON.parse()
-
-The fixedCode field MUST contain the complete corrected source code as a valid JSON string.
-
-Preserve the source code correctly inside the JSON string.
-
-==================================================
-17. EXACT OUTPUT STRUCTURE
-==========================
-
-When bugs are found:
+Return strictly a single JSON object matching this schema:
 
 {
-"language": "${params.language}",
-"status": "bug_found",
-"bugs": [
-{
-"line": 7,
-"type": "runtime",
-"severity": "high",
-"message": "Array index out of bounds",
-"explanation": "The code accesses an index equal to the array length, which is outside the valid array range."
-}
-],
-"fixedCode": "complete corrected source code",
-"explanation": "The detected bugs were corrected while preserving the original program's purpose.",
-"complexity": {
-"time": "O(n)",
-"space": "O(1)"
-},
-"confidence": 0.95
+  "success": true,
+  "language": "${params.language}",
+  "status": "bug_found",
+  "bugs": [
+    {
+      "line": 7,
+      "type": "runtime",
+      "severity": "high",
+      "message": "Short description of bug",
+      "explanation": "Detailed explanation"
+    }
+  ],
+  "issues": [
+    {
+      "line": 7,
+      "type": "runtime",
+      "severity": "error",
+      "description": "Short description of bug"
+    }
+  ],
+  "fixedCode": "complete corrected source code",
+  "correctedCode": "complete corrected source code",
+  "explanation": "Summary of changes made",
+  "complexity": {
+    "time": "O(n)",
+    "space": "O(1)"
+  },
+  "confidence": 0.95
 }
 
 When no bugs exist:
-
 {
-"language": "${params.language}",
-"status": "no_bug_found",
-"bugs": [],
-"fixedCode": null,
-"explanation": "No significant bugs were detected in the submitted code.",
-"complexity": {
-"time": "O(n)",
-"space": "O(1)"
-},
-"confidence": 0.95
+  "success": true,
+  "language": "${params.language}",
+  "status": "no_bug_found",
+  "bugs": [],
+  "issues": [],
+  "fixedCode": null,
+  "correctedCode": null,
+  "explanation": "No significant bugs were detected in the submitted code.",
+  "complexity": {
+    "time": "O(n)",
+    "space": "O(1)"
+  },
+  "confidence": 0.95
 }
 
-When the code genuinely cannot be analyzed:
-
-{
-"language": "${params.language}",
-"status": "analysis_failed",
-"bugs": [],
-"fixedCode": null,
-"explanation": "The submitted code could not be analyzed reliably.",
-"complexity": null,
-"confidence": 0
-}
-
-==================================================
-18. FINAL INTERNAL CHECK
-========================
-
-Before returning the JSON:
-
-[ ] Did I analyze the entire submitted source code?
-[ ] Are all reported bugs real?
-[ ] Are bug types one of the six supported categories?
-[ ] Are severity values valid?
-[ ] Are line numbers accurate?
-[ ] Does fixedCode use the same language?
-[ ] Is fixedCode complete?
-[ ] Is fixedCode syntactically valid?
-[ ] Are array and String operations correct?
-[ ] Are loop boundaries safe?
-[ ] Are null values handled safely?
-[ ] Are divisions protected where necessary?
-[ ] Are recursion base cases safe?
-[ ] Are all imports/includes present?
-[ ] Did I preserve the original program's purpose?
-[ ] Did I fix every reported bug?
-[ ] Did I introduce any new bug?
-[ ] Is the JSON valid?
-
-If ANY answer is NO:
-
-Fix the problem internally before returning the response.
-
-Return ONLY the final JSON object.
+Return ONLY valid JSON. No markdown fences, no extra text.
 `;
 
-      /**
-       * ----------------------------------------------------------
-       * 5. User prompt
-       * ----------------------------------------------------------
-       */
-      const prompt = `
-Language: ${params.language}
-
-Source Code:
-
-${params.sourceCode}
-`;
-
-      this.logger.log(
-        `[AI Pipeline Step 1/8] Language: ${params.language}, Code Length: ${params.sourceCode.length} chars`,
-      );
-
-      const primaryModel = process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.6-flash';
-      const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash';
+      const prompt = `Language: ${params.language}\n\nSource Code:\n${params.sourceCode}`;
+      const primaryModel = (process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.6-flash').trim().replace(/^["']|["']$/g, '');
+      const fallbackModel = (process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash').trim().replace(/^["']|["']$/g, '');
 
       let geminiResult: { text: string; modelUsed: string } | null = null;
       let lastError: any = null;
 
       try {
-        geminiResult = await this.generateWithRetry(
-          ai,
-          primaryModel,
-          prompt,
-          systemPrompt,
-          3,
-        );
+        geminiResult = await this.generateWithRetry(ai, primaryModel, prompt, systemPrompt, 2);
       } catch (primaryErr: any) {
         lastError = primaryErr;
-        const isTemp = this.isTemporaryError(primaryErr);
-
-        if (isTemp && fallbackModel && fallbackModel !== primaryModel) {
-          this.logger.warn(
-            `[Gemini] Primary model '${primaryModel}' failed with temporary availability error. Attempting fallback model '${fallbackModel}'...`,
-          );
-
-          try {
-            geminiResult = await this.generateWithRetry(
-              ai,
-              fallbackModel,
-              prompt,
-              systemPrompt,
-              3,
+        if (!this.isQuotaExhausted(primaryErr) && this.isTemporaryError(primaryErr)) {
+          if (fallbackModel && fallbackModel !== primaryModel) {
+            this.logger.warn(
+              `[Gemini] Primary model '${primaryModel}' temporary error. Trying fallback '${fallbackModel}'...`,
             );
-          } catch (fallbackErr: any) {
-            lastError = fallbackErr;
-            this.logger.error(
-              `[Gemini] Fallback model '${fallbackModel}' also failed: ${
-                fallbackErr?.message || 'Unknown error'
-              }`,
-            );
+            try {
+              geminiResult = await this.generateWithRetry(ai, fallbackModel, prompt, systemPrompt, 1);
+            } catch (fallbackErr: any) {
+              lastError = fallbackErr;
+            }
           }
         }
       }
 
       if (!geminiResult || !geminiResult.text) {
-        const isTemp = this.isTemporaryError(lastError);
-        const errStr =
-          (lastError?.message || '') + JSON.stringify(lastError || {});
-        const isDailyQuotaExhausted =
-          errStr.toLowerCase().includes('quota') &&
-          (errStr.toLowerCase().includes('exceeded') ||
-            errStr.toLowerCase().includes('daily') ||
-            errStr.includes('GenerateRequestsPerDay'));
-
-        const userExplanation = isDailyQuotaExhausted
-          ? 'Gemini API quota has been exhausted. Please try again later or use a project/API key with available quota.'
-          : isTemp
-          ? 'AI analysis is temporarily unavailable because the Gemini service is experiencing high demand. Please try again in a few moments.'
-          : `Gemini API Error: ${
-              lastError?.message ||
-              'Unknown error occurred while contacting AI service.'
-            }`;
-
-        this.logger.error(
-          `[AI Pipeline Final Failure] Temporary: ${isTemp}, Daily Quota Exhausted: ${isDailyQuotaExhausted}, Internal Error: ${
-            lastError?.message || 'Unknown error'
-          }`,
-        );
+        const isQuota = this.isQuotaExhausted(lastError);
+        const userExplanation = isQuota
+          ? 'Gemini API quota has been exhausted. Please try again later or use an API key with available quota.'
+          : 'AI analysis is temporarily unavailable due to high service demand. Please try again in a moment.';
 
         return {
           language: params.language,
@@ -822,191 +260,307 @@ ${params.sourceCode}
       }
 
       const responseText = geminiResult.text;
-      this.logger.log(
-        `[AI Pipeline Step 3/8] Gemini API Call: SUCCESS (using model '${geminiResult.modelUsed}')`,
-      );
+      const cleanedText = responseText.trim().replace(/^\s*```(json)?/i, '').replace(/```\s*$/i, '').trim();
 
-      this.logger.log(
-        `[AI Pipeline Step 4/8] Gemini Raw Response:\n${responseText}`,
-      );
-
-      /**
-       * ----------------------------------------------------------
-       * 8. Clean JSON response
-       * ----------------------------------------------------------
-       */
-      let cleanedText = responseText.trim();
-
-      if (cleanedText.startsWith('```json')) {
-        cleanedText = cleanedText
-          .replace(/^```json\s*/i, '')
-          .replace(/\s*```$/i, '')
-          .trim();
-      } else if (cleanedText.startsWith('```')) {
-        cleanedText = cleanedText
-          .replace(/^```\s*/i, '')
-          .replace(/\s*```$/i, '')
-          .trim();
-      }
-
-      /**
-       * ----------------------------------------------------------
-       * 9. Parse JSON
-       * ----------------------------------------------------------
-       */
       let rawJson: any;
-
       try {
         rawJson = JSON.parse(cleanedText);
-        this.logger.log(
-          `[AI Pipeline Step 5/8] JSON Parsing Result: SUCCESS`,
-        );
       } catch (jsonError) {
-        this.logger.error(
-          `[AI Pipeline Step 5/8] JSON Parsing Result: FAILED (${cleanedText})`,
-        );
-
         return {
           language: params.language,
           status: 'analysis_failed',
           bugs: [],
           fixedCode: null,
-          explanation:
-            'Gemini returned an invalid JSON response. The code could not be analyzed safely.',
+          explanation: 'Gemini returned an invalid JSON response. The code could not be analyzed safely.',
           complexity: null,
           confidence: 0,
         };
       }
 
-      /**
-       * ----------------------------------------------------------
-       * 10. Normalize AI response before Zod validation
-       * ----------------------------------------------------------
-       */
-      const normalizedResult = this.normalizeGeminiResponse(
-        rawJson,
-        params.language,
-      );
+      const normalized = this.normalizeGeminiResponse(rawJson, params.language);
+      const parsed = AnalysisResultSchema.safeParse(normalized);
 
-      this.logger.log(
-        `[AI Pipeline Step 7/8] Normalized Result:\n${JSON.stringify(normalizedResult, null, 2)}`,
-      );
-
-      /**
-       * ----------------------------------------------------------
-       * 11. Validate normalized response
-       * ----------------------------------------------------------
-       */
-      const parsedResult =
-        AnalysisResultSchema.safeParse(normalizedResult);
-
-      if (!parsedResult.success) {
-        this.logger.warn(
-          `[AI Pipeline Step 6/8] Zod Validation Result: WARNING/FAILED (${JSON.stringify(
-            parsedResult.error.format(),
-          )})`,
-        );
-
-        const safeResult = this.createSafeFallback(
-          normalizedResult,
-          params.language,
-        );
-
-        this.logger.log(
-          `[AI Pipeline Step 8/8] Final Result Returned to Frontend: status='${safeResult.status}', bugs=${safeResult.bugs.length}`,
-        );
-
-        return safeResult;
+      if (!parsed.success) {
+        return this.createSafeFallback(normalized, params.language);
       }
 
-      this.logger.log(
-        `[AI Pipeline Step 6/8] Zod Validation Result: SUCCESS`,
-      );
-      this.logger.log(
-        `[AI Pipeline Step 8/8] Final Result Returned to Frontend: status='${parsedResult.data.status}', bugs=${parsedResult.data.bugs.length}`,
-      );
-
-      return parsedResult.data;
+      return parsed.data;
     } catch (error: any) {
-      this.logger.error(
-        `[AI Pipeline Step Unexpected Exception]: ${
-          error?.message || 'Unknown error'
-        }`,
-        error?.stack,
-      );
-
+      this.logger.error(`[analyzeCode Exception] ${error?.message || 'Unknown error'}`);
       return {
         language: params.language,
         status: 'analysis_failed',
         bugs: [],
         fixedCode: null,
-        explanation:
-          'AI analysis is temporarily unavailable because the Gemini service experienced an unexpected error. Please try again.',
+        explanation: 'AI analysis is temporarily unavailable. Please try again.',
         complexity: null,
         confidence: 0,
       };
     }
   }
 
-  /**
-   * Helper method to classify temporary/retryable errors vs permanent errors.
-   */
+  async convertCode(params: {
+    sourceLanguage: string;
+    targetLanguage: string;
+    sourceCode: string;
+  }): Promise<ConversionResult> {
+    const rawApiKey = process.env.GEMINI_API_KEY;
+    const apiKey = rawApiKey ? rawApiKey.trim().replace(/^["']|["']$/g, '') : '';
+
+    if (!apiKey || apiKey === 'your-gemini-api-key') {
+      throw new BadRequestException('GEMINI_API_KEY is not configured in backend environment.');
+    }
+
+    if (!params.sourceCode || params.sourceCode.trim() === '') {
+      throw new BadRequestException('Source code cannot be empty.');
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const primaryModel = (process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.6-flash').trim().replace(/^["']|["']$/g, '');
+    const fallbackModel = (process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash').trim().replace(/^["']|["']$/g, '');
+
+    const systemPrompt = `
+You are a senior software engineer performing semantics-preserving source-code translation. Do not merely translate syntax. Preserve behavior, input/output contract, edge cases, and algorithmic intent. Produce idiomatic code in the target language.
+
+SOURCE LANGUAGE: "${params.sourceLanguage}"
+TARGET LANGUAGE: "${params.targetLanguage}"
+
+==================================================
+LANGUAGE CONVERSION & CONSTRAINTS MATRIX
+==================================================
+- Idiomatic Syntax: Use standard practices and native conventions for "${params.targetLanguage}".
+- Data Structures:
+  * Map Python list/dict/set to Java ArrayList/HashMap/HashSet, C++ vector/unordered_map, C arrays/structs, JS Array/Object/Map/Set, TS typed equivalents.
+  * Map Java classes/interfaces/generics to C++ class/struct, Python class/dataclass, JS/TS class.
+  * Map C/C++ pointer operations & dynamic memory to standard GC collections or clean C/C++ memory management (malloc/free, new/delete, RAII, headers).
+  * Map JS/TS async/promises/objects to target language async or synchronous equivalents.
+  * Preserve TS interfaces, types, generics when target is TS, Java, or C++; adapt for JS/Python.
+- I/O & Streams: Maintain standard I/O behavior (Scanner/System.out, sys.stdin/print, scanf/printf, cin/cout, console.log/fs.readFileSync).
+- Edge Cases & Safety: Maintain boundary conditions, null/undefined handling, division-by-zero protection.
+
+==================================================
+STRICT JSON OUTPUT REQUIREMENT
+==================================================
+Return ONLY ONE valid JSON object:
+
+{
+  "success": true,
+  "sourceLanguage": "${params.sourceLanguage}",
+  "targetLanguage": "${params.targetLanguage}",
+  "convertedCode": "COMPLETE CONVERTED SOURCE CODE IN TARGET LANGUAGE",
+  "explanation": "Summary of key architectural and translation changes.",
+  "notes": [
+    "Library or pattern mapping details..."
+  ],
+  "warnings": []
+}
+
+CRITICAL:
+1. "convertedCode" MUST contain valid, complete source code in "${params.targetLanguage}".
+2. Do NOT wrap "convertedCode" inside markdown fences.
+3. Return ONLY valid JSON.
+`;
+
+    const userPrompt = `Source Language: ${params.sourceLanguage}\nTarget Language: ${params.targetLanguage}\n\nOriginal Code:\n${params.sourceCode}`;
+
+    let geminiResult: { text: string; modelUsed: string } | null = null;
+    let lastError: any = null;
+
+    try {
+      geminiResult = await this.generateWithRetry(ai, primaryModel, userPrompt, systemPrompt, 2);
+    } catch (primaryErr: any) {
+      lastError = primaryErr;
+      if (!this.isQuotaExhausted(primaryErr) && this.isTemporaryError(primaryErr)) {
+        if (fallbackModel && fallbackModel !== primaryModel) {
+          this.logger.warn(
+            `[Gemini Convert] Primary model '${primaryModel}' temporary error. Trying fallback '${fallbackModel}'...`,
+          );
+          try {
+            geminiResult = await this.generateWithRetry(ai, fallbackModel, userPrompt, systemPrompt, 1);
+          } catch (fallbackErr: any) {
+            lastError = fallbackErr;
+          }
+        }
+      }
+    }
+
+    if (!geminiResult || !geminiResult.text) {
+      const isQuota = this.isQuotaExhausted(lastError);
+      const userMessage = isQuota
+        ? 'Gemini API quota has been exhausted. Please try again later.'
+        : 'Code conversion is temporarily unavailable due to high service demand. Please try again.';
+      throw new BadRequestException(userMessage);
+    }
+
+    const cleanedText = geminiResult.text.trim().replace(/^\s*```(json)?/i, '').replace(/```\s*$/i, '').trim();
+
+    try {
+      const rawJson = JSON.parse(cleanedText);
+      if (rawJson.convertedCode) {
+        rawJson.convertedCode = cleanCodeFence(rawJson.convertedCode);
+      }
+      const parsed = ConversionResultSchema.parse(rawJson);
+      return parsed as ConversionResult;
+    } catch (err: any) {
+      this.logger.error(`[Convert Parsing Error] ${err.message}\nRaw Output: ${cleanedText}`);
+      throw new BadRequestException('Invalid response format returned during code conversion.');
+    }
+  }
+
+  async processPrompt(params: {
+    prompt: string;
+    language: string;
+    sourceCode?: string;
+  }): Promise<PromptResult> {
+    const rawApiKey = process.env.GEMINI_API_KEY;
+    const apiKey = rawApiKey ? rawApiKey.trim().replace(/^["']|["']$/g, '') : '';
+    if (!apiKey || apiKey === 'your-gemini-api-key') {
+      throw new BadRequestException('GEMINI_API_KEY is not configured in backend environment.');
+    }
+
+    // Detect explicit convert intent from user prompt text
+    const isConvertPrompt = /convert|translate|switch to|rewrite in/i.test(params.prompt);
+
+    if (isConvertPrompt && params.sourceCode && params.sourceCode.trim() !== '') {
+      // Determine target language from prompt
+      const targetMatch = params.prompt.match(/(java|python|javascript|typescript|c\+\+|cpp|\bc\b)/i);
+      let targetLang = params.language;
+      if (targetMatch) {
+        const rawMatch = targetMatch[1].toLowerCase();
+        if (rawMatch === 'python' || rawMatch === 'py') targetLang = 'Python';
+        else if (rawMatch === 'java') targetLang = 'Java';
+        else if (rawMatch === 'c') targetLang = 'C';
+        else if (rawMatch === 'cpp' || rawMatch === 'c++') targetLang = 'C++';
+        else if (rawMatch === 'javascript' || rawMatch === 'js') targetLang = 'JavaScript';
+        else if (rawMatch === 'typescript' || rawMatch === 'ts') targetLang = 'TypeScript';
+      }
+
+      const conversion = await this.convertCode({
+        sourceLanguage: params.language,
+        targetLanguage: targetLang,
+        sourceCode: params.sourceCode,
+      });
+
+      return {
+        intent: 'convert',
+        language: targetLang,
+        sourceLanguage: params.language,
+        targetLanguage: targetLang,
+        solution: conversion.convertedCode,
+        convertedCode: conversion.convertedCode,
+        problemExplanation: conversion.explanation,
+        learningExplanation: conversion.explanation,
+        warnings: conversion.warnings || [],
+        notes: conversion.notes || [],
+      };
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const primaryModel = (process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.6-flash').trim().replace(/^["']|["']$/g, '');
+
+    const systemPrompt = `
+You are the CodeVerix AI coding assistant.
+Analyze the user's prompt and determine the correct intent.
+
+Supported intents: "solve", "fix", "explain", "optimize", "convert", "generate_tests", "debug", "review".
+
+The current language is "${params.language}".
+
+Return strictly a single JSON object matching this schema:
+{
+  "intent": "solve",
+  "language": "${params.language}",
+  "problemExplanation": "Explanation of the solution or answer",
+  "solution": "Complete code solution if code is requested",
+  "convertedCode": "Converted code if intent is convert",
+  "complexity": { "time": "O(n)", "space": "O(1)" },
+  "testCases": [{"input": "...", "expected": "..."}],
+  "warnings": ["..."],
+  "learningExplanation": "Educational concepts explanation"
+}
+
+CRITICAL: Return ONLY ONE valid JSON object without markdown fences. Do NOT wrap solution or convertedCode in backticks inside the JSON strings.
+`;
+
+    const userPrompt = `Language: ${params.language}\nUser Prompt: ${params.prompt}${
+      params.sourceCode ? `\n\nSource Code:\n${params.sourceCode}` : ''
+    }`;
+
+    let result: { text: string; modelUsed: string };
+    try {
+      result = await this.generateWithRetry(ai, primaryModel, userPrompt, systemPrompt, 2);
+    } catch (err: any) {
+      const isQuota = this.isQuotaExhausted(err);
+      const errMsg = isQuota
+        ? 'Gemini API quota has been exhausted. Please try again later.'
+        : `AI Prompt Error: ${err?.message || 'AI service error.'}`;
+      throw new BadRequestException(errMsg);
+    }
+
+    const cleanedText = result.text.trim().replace(/^\s*```(json)?/i, '').replace(/```\s*$/i, '').trim();
+
+    try {
+      const rawJson = JSON.parse(cleanedText);
+      if (rawJson.solution) rawJson.solution = cleanCodeFence(rawJson.solution);
+      if (rawJson.convertedCode) rawJson.convertedCode = cleanCodeFence(rawJson.convertedCode);
+      const parsed = PromptResultSchema.parse(rawJson);
+      return parsed as PromptResult;
+    } catch (err: any) {
+      this.logger.error(`Failed to parse PromptResult: ${err.message}\nRaw JSON: ${cleanedText}`);
+      throw new BadRequestException('Invalid JSON response returned from AI service.');
+    }
+  }
+
+  private isQuotaExhausted(error: any): boolean {
+    if (!error) return false;
+    const msg = (error.message || '').toLowerCase();
+    const statusStr = (error.status || '').toString().toLowerCase();
+    const errStr = JSON.stringify(error).toLowerCase();
+
+    return (
+      msg.includes('quota') ||
+      msg.includes('generaterequestsperday') ||
+      msg.includes('daily_limit') ||
+      statusStr.includes('resource_exhausted') ||
+      errStr.includes('quota exceeded') ||
+      errStr.includes('resource_exhausted')
+    );
+  }
+
   private isTemporaryError(error: any): boolean {
     if (!error) return false;
-
-    const statusCode =
-      error.status || error.code || error.statusCode || error.response?.status;
-    const message = (error.message || '').toLowerCase();
+    const statusCode = error.status || error.code || error.statusCode || error.response?.status;
+    const msg = (error.message || '').toLowerCase();
     const statusStr = (error.status || '').toString().toLowerCase();
 
     if (
       statusCode === 400 ||
       statusCode === '400' ||
-      message.includes('api_key_invalid') ||
-      message.includes('api key not valid') ||
-      message.includes('invalid_argument')
+      msg.includes('api_key_invalid') ||
+      msg.includes('invalid_argument')
     ) {
       return false;
     }
 
-    const temporaryCodes = [
-      429, 503, 408, 500, 502, 504,
-      '429', '503', '408', '500', '502', '504',
-    ];
-    if (temporaryCodes.includes(statusCode)) {
-      return true;
-    }
-
-    if (
+    return (
+      statusCode === 503 ||
+      statusCode === '503' ||
+      statusCode === 500 ||
+      statusCode === '500' ||
+      statusCode === 502 ||
+      statusCode === '502' ||
+      statusCode === 504 ||
+      statusCode === '504' ||
       statusStr.includes('unavailable') ||
-      statusStr.includes('resource_exhausted') ||
-      message.includes('503') ||
-      message.includes('429') ||
-      message.includes('500') ||
-      message.includes('502') ||
-      message.includes('504') ||
-      message.includes('408') ||
-      message.includes('unavailable') ||
-      message.includes('resource_exhausted') ||
-      message.includes('high demand') ||
-      message.includes('overloaded') ||
-      message.includes('rate limit') ||
-      message.includes('quota') ||
-      message.includes('try again later') ||
-      message.includes('temporary')
-    ) {
-      return true;
-    }
-
-    return false;
+      msg.includes('503') ||
+      msg.includes('unavailable') ||
+      msg.includes('high demand') ||
+      msg.includes('overloaded')
+    );
   }
 
-  /**
-   * Helper method to parse server-provided retry delay (in ms) from Gemini API errors.
-   */
   private extractServerRetryDelay(error: any): number | null {
     if (!error) return null;
-
     if (Array.isArray(error.details)) {
       for (const item of error.details) {
         if (item && typeof item.retryDelay === 'string') {
@@ -1018,58 +572,18 @@ ${params.sourceCode}
         }
       }
     }
-
-    if (typeof error.retryDelay === 'string') {
-      const match = error.retryDelay.match(/(\d+(?:\.\d+)?)\s*s?/i);
-      if (match) {
-        const sec = parseFloat(match[1]);
-        if (!isNaN(sec) && sec > 0) return Math.round(sec * 1000);
-      }
-    }
-
-    const textSources = [
-      typeof error.message === 'string' ? error.message : '',
-      typeof error.status === 'string' ? error.status : '',
-      JSON.stringify(error),
-    ];
-
-    for (const text of textSources) {
-      if (!text) continue;
-      const match = text.match(
-        /retry\s*(?:in|after|delay[:=]?\s*")?\s*(\d+(?:\.\d+)?)\s*s/i,
-      );
-      if (match) {
-        const sec = parseFloat(match[1]);
-        if (!isNaN(sec) && sec > 0) return Math.round(sec * 1000);
-      }
-    }
-
     return null;
   }
 
-  /**
-   * Random jitter between 0 and 1000ms to avoid thundering herd.
-   */
-  private getJitter(): number {
-    return Math.floor(Math.random() * 1000);
-  }
-
-  /**
-   * Helper method to call Gemini API with server-provided delay or bounded exponential backoff.
-   */
   private async generateWithRetry(
     ai: GoogleGenAI,
     modelName: string,
     prompt: string,
     systemPrompt: string,
-    maxRetries: number = 3,
+    maxRetries: number = 2,
   ): Promise<{ text: string; modelUsed: string }> {
-    const fallbackDelays = [2000, 5000, 10000, 20000];
-
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      this.logger.log(
-        `[Gemini] Attempt ${attempt}/${maxRetries} using model '${modelName}'`,
-      );
+      this.logger.log(`[Gemini] Attempt ${attempt}/${maxRetries} on model '${modelName}'`);
 
       try {
         const response = await ai.models.generateContent({
@@ -1084,565 +598,172 @@ ${params.sourceCode}
 
         const text = response.text;
         if (text && text.trim() !== '') {
-          this.logger.log(
-            `[Gemini] Model '${modelName}' succeeded on attempt ${attempt}`,
-          );
           return { text, modelUsed: modelName };
         }
-
-        this.logger.warn(
-          `[Gemini] Model '${modelName}' returned an empty response on attempt ${attempt}`,
-        );
       } catch (error: any) {
+        if (this.isQuotaExhausted(error)) {
+          this.logger.error(`[Gemini] Quota exhausted on model '${modelName}': ${error?.message || 'Quota exceeded'}`);
+          throw error;
+        }
+
         const isRetryable = this.isTemporaryError(error);
-        const statusCode =
-          error.status || error.code || error.statusCode || 'UNKNOWN';
-        const errorMsg = error?.message || 'Unknown error';
-
-        if (!isRetryable) {
-          this.logger.error(
-            `[Gemini] Permanent error on model '${modelName}' (${statusCode}): ${errorMsg}. Halting retries.`,
-          );
+        if (!isRetryable || attempt >= maxRetries) {
           throw error;
         }
 
-        this.logger.warn(
-          `[Gemini] Temporary error ${statusCode} on model '${modelName}' (Attempt ${attempt}/${maxRetries}): ${errorMsg}`,
-        );
-
-        if (attempt < maxRetries) {
-          const serverDelay = this.extractServerRetryDelay(error);
-          let baseDelayMs: number;
-
-          if (serverDelay !== null && serverDelay > 0) {
-            baseDelayMs = serverDelay;
-            const sec = Math.round(serverDelay / 1000);
-            this.logger.log(`[Gemini] ${statusCode} RESOURCE_EXHAUSTED received.`);
-            this.logger.log(`[Gemini] Server requested retry after ${sec}s.`);
-          } else {
-            baseDelayMs = fallbackDelays[attempt - 1] || 10000;
-          }
-
-          const totalDelayMs = baseDelayMs + this.getJitter();
-          this.logger.log(`[Gemini] Waiting ${totalDelayMs}ms before retry...`);
-          await new Promise((resolve) => setTimeout(resolve, totalDelayMs));
-        } else {
-          this.logger.error(
-            `[Gemini] All ${maxRetries} attempts exhausted for model '${modelName}'.`,
-          );
-          throw error;
-        }
+        const serverDelay = this.extractServerRetryDelay(error);
+        const delayMs = serverDelay ? Math.min(serverDelay, 3000) : 1500 + Math.floor(Math.random() * 500);
+        this.logger.warn(`[Gemini] Temporary error on model '${modelName}'. Retrying in ${delayMs}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
 
-    throw new Error(
-      `Failed to generate content with model '${modelName}' after ${maxRetries} attempts.`,
-    );
+    throw new Error(`Failed to generate content with model '${modelName}' after ${maxRetries} attempts.`);
   }
 
-  /**
-   * Normalize Gemini response into the exact structure expected
-   * by the frontend/backend.
-   */
-  private normalizeGeminiResponse(
-    rawJson: any,
-    language: string,
-  ): any {
-    /**
-     * -----------------------------
-     * Normalize status
-     * -----------------------------
-     */
-    let status:
-      | 'bug_found'
-      | 'no_bug_found'
-      | 'analysis_failed';
+  private normalizeGeminiResponse(rawJson: any, language: string): any {
+    let status: 'bug_found' | 'no_bug_found' | 'analysis_failed';
 
-    if (
-      rawJson?.status === 'bug_found' ||
-      rawJson?.status === 'no_bug_found' ||
-      rawJson?.status === 'analysis_failed'
-    ) {
+    if (rawJson?.status === 'bug_found' || rawJson?.status === 'no_bug_found' || rawJson?.status === 'analysis_failed') {
       status = rawJson.status;
-    } else if (
-      Array.isArray(rawJson?.bugs) &&
-      rawJson.bugs.length > 0
-    ) {
-      /**
-       * If Gemini forgot status but returned bugs,
-       * infer bug_found.
-       */
+    } else if (Array.isArray(rawJson?.bugs) && rawJson.bugs.length > 0) {
       status = 'bug_found';
     } else {
       status = 'analysis_failed';
     }
 
-    /**
-     * -----------------------------
-     * Normalize bugs
-     * -----------------------------
-     */
-    const bugs = Array.isArray(rawJson?.bugs)
-      ? rawJson.bugs
-          .map((bug: any) =>
-            this.normalizeBug(bug),
-          )
-          .filter(Boolean)
+    const bugs: BugDetail[] = Array.isArray(rawJson?.bugs)
+      ? rawJson.bugs.map((bug: any) => this.normalizeBug(bug)).filter(Boolean)
       : [];
 
-    /**
-     * If Gemini says no bugs but somehow returns bugs,
-     * trust the actual bug list.
-     */
-    if (
-      status === 'no_bug_found' &&
-      bugs.length > 0
-    ) {
+    const issues: AnalysisIssue[] = Array.isArray(rawJson?.issues)
+      ? rawJson.issues.map((i: any) => ({
+          line: typeof i?.line === 'number' ? i.line : null,
+          type: i?.type || 'runtime',
+          severity: i?.severity || 'error',
+          description: i?.description || i?.message || 'Issue detected',
+        }))
+      : bugs.map((b) => ({
+          line: b.line,
+          type: b.type,
+          severity: b.severity === 'high' ? 'error' : 'warning',
+          description: b.message,
+        }));
+
+    if (status === 'no_bug_found' && bugs.length > 0) {
       status = 'bug_found';
     }
 
-    /**
-     * -----------------------------
-     * Normalize complexity
-     * -----------------------------
-     */
     let complexity: { time?: string; space?: string } | null = null;
-
-    if (
-      rawJson?.complexity &&
-      typeof rawJson.complexity === 'object'
-    ) {
+    if (rawJson?.complexity && typeof rawJson.complexity === 'object') {
       complexity = {
-        time:
-          typeof rawJson.complexity.time === 'string'
-            ? rawJson.complexity.time
-            : undefined,
-
-        space:
-          typeof rawJson.complexity.space === 'string'
-            ? rawJson.complexity.space
-            : undefined,
+        time: typeof rawJson.complexity.time === 'string' ? rawJson.complexity.time : undefined,
+        space: typeof rawJson.complexity.space === 'string' ? rawJson.complexity.space : undefined,
       };
     }
 
-    /**
-     * -----------------------------
-     * Normalize confidence
-     * -----------------------------
-     */
-    let confidence = 0;
-
-    if (
-      typeof rawJson?.confidence === 'number' &&
-      Number.isFinite(rawJson.confidence)
-    ) {
-      confidence = Math.max(
-        0,
-        Math.min(1, rawJson.confidence),
-      );
+    let confidence = 0.9;
+    if (typeof rawJson?.confidence === 'number' && Number.isFinite(rawJson.confidence)) {
+      confidence = Math.max(0, Math.min(1, rawJson.confidence));
     }
 
-    /**
-     * -----------------------------
-     * Normalize fixedCode
-     * -----------------------------
-     */
-    const fixedCode =
-      typeof rawJson?.fixedCode === 'string' &&
-      rawJson.fixedCode.trim() !== ''
-        ? rawJson.fixedCode
-        : null;
-
-    /**
-     * -----------------------------
-     * Normalize explanation
-     * -----------------------------
-     */
+    const fixedCode = cleanCodeFence(rawJson?.fixedCode || rawJson?.correctedCode);
     const explanation =
-      typeof rawJson?.explanation === 'string' &&
-      rawJson.explanation.trim() !== ''
+      typeof rawJson?.explanation === 'string' && rawJson.explanation.trim() !== ''
         ? rawJson.explanation
         : status === 'bug_found'
-          ? 'One or more issues were detected in the submitted code.'
-          : status === 'no_bug_found'
-            ? 'No significant bugs were detected in the submitted code.'
-            : 'The code could not be analyzed successfully.';
+        ? 'Issues detected and resolved in the submitted code.'
+        : 'No significant bugs detected in the code.';
 
     return {
-      language:
-        typeof rawJson?.language === 'string' &&
-        rawJson.language.trim() !== ''
-          ? rawJson.language
-          : language,
-
+      success: status !== 'analysis_failed',
+      language: typeof rawJson?.language === 'string' ? rawJson.language : language,
       status,
-
       bugs,
-
+      issues,
       fixedCode,
-
+      correctedCode: fixedCode,
       explanation,
-
       complexity,
-
       confidence,
     };
   }
 
-  /**
-   * Normalize individual bug objects.
-   */
-  private normalizeBug(bug: any): any | null {
-    if (!bug || typeof bug !== 'object') {
-      return null;
-    }
-
-    /**
-     * -----------------------------
-     * Normalize line
-     * -----------------------------
-     */
+  private normalizeBug(bug: any): BugDetail | null {
+    if (!bug || typeof bug !== 'object') return null;
     let line: number | null = null;
+    if (typeof bug.line === 'number') line = bug.line;
+    else if (typeof bug.line === 'string' && /^\d+$/.test(bug.line.trim())) line = Number(bug.line.trim());
 
-    if (typeof bug.line === 'number') {
-      line = bug.line;
-    } else if (
-      typeof bug.line === 'string' &&
-      /^\d+$/.test(bug.line.trim())
-    ) {
-      line = Number(bug.line.trim());
-    }
-
-    /**
-     * -----------------------------
-     * Normalize type
-     * -----------------------------
-     *
-     * Gemini may occasionally return:
-     * - undefined_behavior
-     * - out_of_bounds
-     * - compilation
-     * - null_pointer
-     *
-     * Map them into our supported frontend categories.
-     */
     const type = this.normalizeBugType(bug.type);
-
-    /**
-     * -----------------------------
-     * Normalize severity
-     * -----------------------------
-     */
-    const severity = this.normalizeSeverity(
-      bug.severity,
-    );
-
-    /**
-     * -----------------------------
-     * Normalize message
-     * -----------------------------
-     */
-    const message =
-      typeof bug.message === 'string' &&
-      bug.message.trim() !== ''
-        ? bug.message
-        : 'Bug detected';
-
-    /**
-     * -----------------------------
-     * Normalize explanation
-     * -----------------------------
-     */
+    const severity = this.normalizeSeverity(bug.severity);
+    const message = typeof bug.message === 'string' && bug.message.trim() !== '' ? bug.message : 'Bug detected';
     const explanation =
-      typeof bug.explanation === 'string' &&
-      bug.explanation.trim() !== ''
+      typeof bug.explanation === 'string' && bug.explanation.trim() !== ''
         ? bug.explanation
-        : 'An issue was detected in the submitted code.';
+        : 'Issue detected in code.';
 
-    return {
-      line,
-      type,
-      severity,
-      message,
-      explanation,
-    };
+    return { line, type, severity, message, explanation };
   }
 
-  /**
-   * Convert language-specific bug categories into
-   * the six categories supported by the application.
-   */
-  private normalizeBugType(
-    type: any,
-  ):
-    | 'syntax'
-    | 'runtime'
-    | 'logical'
-    | 'type'
-    | 'performance'
-    | 'security' {
-    if (typeof type !== 'string') {
-      return 'runtime';
-    }
-
-    const normalized = type
-      .toLowerCase()
-      .trim()
-      .replace(/[\s-]+/g, '_');
-
-    switch (normalized) {
+  private normalizeBugType(type: any): BugDetail['type'] {
+    if (typeof type !== 'string') return 'runtime';
+    const norm = type.toLowerCase().trim().replace(/[\s-]+/g, '_');
+    switch (norm) {
       case 'syntax':
       case 'syntax_error':
       case 'parse':
-      case 'parsing':
         return 'syntax';
-
       case 'runtime':
       case 'runtime_error':
-      case 'undefined_behavior':
-      case 'out_of_bounds':
-      case 'array_out_of_bounds':
-      case 'index_out_of_bounds':
       case 'null_pointer':
-      case 'null_pointer_dereference':
-      case 'division_by_zero':
-      case 'memory':
-      case 'memory_error':
-      case 'segmentation_fault':
-      case 'segfault':
-      case 'crash':
+      case 'out_of_bounds':
         return 'runtime';
-
       case 'logical':
       case 'logic':
-      case 'logic_error':
         return 'logical';
-
       case 'type':
       case 'type_error':
-      case 'type_mismatch':
-      case 'typing':
         return 'type';
-
       case 'performance':
-      case 'performance_error':
-      case 'optimization':
-      case 'inefficient':
         return 'performance';
-
       case 'security':
-      case 'security_error':
-      case 'vulnerability':
-      case 'vulnerable':
         return 'security';
-
-      case 'compilation':
-      case 'compile':
-      case 'compile_error':
-      case 'compiler':
-        return 'syntax';
-
       default:
-        /**
-         * Unknown categories are safest as runtime
-         * instead of crashing the entire analysis.
-         */
         return 'runtime';
     }
   }
 
-  /**
-   * Normalize severity.
-   */
-  private normalizeSeverity(
-    severity: any,
-  ): 'high' | 'medium' | 'low' {
-    if (typeof severity !== 'string') {
-      return 'medium';
-    }
-
-    const normalized = severity
-      .toLowerCase()
-      .trim();
-
-    if (normalized === 'high') {
-      return 'high';
-    }
-
-    if (normalized === 'low') {
-      return 'low';
-    }
-
+  private normalizeSeverity(severity: any): 'high' | 'medium' | 'low' {
+    if (typeof severity !== 'string') return 'medium';
+    const norm = severity.toLowerCase().trim();
+    if (norm === 'high' || norm === 'error') return 'high';
+    if (norm === 'low') return 'low';
     return 'medium';
   }
 
-  /**
-   * Safe fallback for partially malformed Gemini responses.
-   *
-   * IMPORTANT:
-   * Never show "No bugs detected" when the analysis actually failed.
-   */
-  private createSafeFallback(
-    result: any,
-    language: string,
-  ): AnalysisResult {
-    const bugs = Array.isArray(result?.bugs)
-      ? result.bugs
-      : [];
-
+  private createSafeFallback(result: any, language: string): AnalysisResult {
+    const bugs = Array.isArray(result?.bugs) ? result.bugs : [];
     const status =
-      result?.status === 'bug_found' &&
-      bugs.length > 0
+      result?.status === 'bug_found' && bugs.length > 0
         ? 'bug_found'
-        : result?.status === 'no_bug_found' &&
-            bugs.length === 0
-          ? 'no_bug_found'
-          : 'analysis_failed';
+        : result?.status === 'no_bug_found'
+        ? 'no_bug_found'
+        : 'analysis_failed';
 
-    /**
-     * If we have real bugs, keep them.
-     */
-    if (status === 'bug_found') {
-      return {
-        language:
-          typeof result?.language === 'string'
-            ? result.language
-            : language,
+    const fixedCode = cleanCodeFence(result?.fixedCode || result?.correctedCode);
 
-        status: 'bug_found',
-
-        bugs,
-
-        fixedCode:
-          typeof result?.fixedCode === 'string'
-            ? result.fixedCode
-            : null,
-
-        explanation:
-          typeof result?.explanation === 'string'
-            ? result.explanation
-            : 'Bugs were detected in the submitted code.',
-
-        complexity:
-          result?.complexity || null,
-
-        confidence:
-          typeof result?.confidence === 'number'
-            ? result.confidence
-            : 0.7,
-      };
-    }
-
-    /**
-     * Valid no-bug result.
-     */
-    if (status === 'no_bug_found') {
-      return {
-        language:
-          typeof result?.language === 'string'
-            ? result.language
-            : language,
-
-        status: 'no_bug_found',
-
-        bugs: [],
-
-        fixedCode: null,
-
-        explanation:
-          typeof result?.explanation === 'string'
-            ? result.explanation
-            : 'No significant bugs were detected in the submitted code.',
-
-        complexity:
-          result?.complexity || null,
-
-        confidence:
-          typeof result?.confidence === 'number'
-            ? result.confidence
-            : 0.8,
-      };
-    }
-
-    /**
-     * Actual analysis failure.
-     */
     return {
+      success: status !== 'analysis_failed',
       language,
-      status: 'analysis_failed',
-      bugs: [],
-      fixedCode: null,
-      explanation:
-        'The AI response could not be validated safely. Please try the analysis again.',
-      complexity: null,
-      confidence: 0,
+      status,
+      bugs,
+      issues: result?.issues || [],
+      fixedCode,
+      correctedCode: fixedCode,
+      explanation: result?.explanation || 'Analysis completed.',
+      complexity: result?.complexity || null,
+      confidence: typeof result?.confidence === 'number' ? result.confidence : 0.8,
     };
-  }
-
-  async processPrompt(params: {
-    prompt: string;
-    language: string;
-    sourceCode?: string;
-  }): Promise<PromptResult> {
-    const rawApiKey = process.env.GEMINI_API_KEY;
-    const apiKey = rawApiKey ? rawApiKey.trim().replace(/^["']|["']$/g, '') : '';
-    if (!apiKey || apiKey === 'your-gemini-api-key') {
-      throw new BadRequestException('GEMINI_API_KEY is not configured in backend environment.');
-    }
-
-    const ai = new GoogleGenAI({ apiKey });
-    const primaryModel = (process.env.GEMINI_PRIMARY_MODEL || 'gemini-3.6-flash')
-      .trim()
-      .replace(/^["']|["']$/g, '');
-
-    const systemPrompt = `
-You are the CodeVerix AI coding assistant.
-Analyze the user's prompt and determine the correct intent.
-
-The supported intents are: "solve", "fix", "explain", "optimize", "convert", "generate_tests", "debug", "review".
-
-Based on the intent, supply the relevant fields in the JSON.
-The language is "${params.language}".
-
-Return strictly a JSON object matching this schema:
-{
-  "intent": "solve",
-  "language": "java",
-  "problemExplanation": "...",
-  "solution": "...",
-  "complexity": { "time": "O(n)", "space": "O(1)" },
-  "testCases": [{"input": "...", "expected": "..."}],
-  "warnings": ["..."],
-  "learningExplanation": "..."
-}
-
-CRITICAL: Return ONLY ONE valid JSON object, without Markdown, backticks, or outside text.
-`;
-
-    const userPrompt = `
-Language: ${params.language}
-User Prompt: ${params.prompt}
-${params.sourceCode ? `\nSource Code:\n${params.sourceCode}` : ''}
-`;
-
-    let result: { text: string; modelUsed: string };
-    try {
-      result = await this.generateWithRetry(ai, primaryModel, userPrompt, systemPrompt, 3);
-    } catch (err: any) {
-      const errMsg = err?.message || 'Unknown error during AI request processing.';
-      this.logger.error(`[processPrompt Failure] ${errMsg}`, err.stack);
-      throw new BadRequestException(`AI Prompt Error: ${errMsg}`);
-    }
-
-    const cleanedText = result.text.trim().replace(/^\s*```(json)?/i, '').replace(/```\s*$/i, '').trim();
-
-    try {
-      const rawJson = JSON.parse(cleanedText);
-      const parsed = PromptResultSchema.parse(rawJson);
-      return parsed as PromptResult;
-    } catch (err: any) {
-      this.logger.error(`Failed to parse PromptResult: ${err.message}\nRaw JSON: ${cleanedText}`);
-      throw new BadRequestException('Invalid JSON response returned from AI service.');
-    }
   }
 }

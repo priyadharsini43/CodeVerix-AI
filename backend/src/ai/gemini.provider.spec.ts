@@ -5,16 +5,15 @@ describe('GeminiProvider', () => {
   let provider: GeminiProvider;
 
   beforeEach(async () => {
-    // Ensure API Key exists for the constructor/method checks
     process.env.GEMINI_API_KEY = 'test-mock-key';
+    process.env.GEMINI_PRIMARY_MODEL = 'gemini-3.6-flash';
+    process.env.GEMINI_FALLBACK_MODEL = 'gemini-3.5-flash';
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [GeminiProvider],
     }).compile();
 
     provider = module.get<GeminiProvider>(GeminiProvider);
-
-    // Mock the private generateWithRetry method to avoid absolute real API calls
     (provider as any).generateWithRetry = jest.fn();
   });
 
@@ -105,12 +104,16 @@ describe('GeminiProvider', () => {
       expect(result.complexity?.time).toBe('O(1)');
     });
 
-    it('should correctly parse the "convert" intent', async () => {
+    it('should correctly handle "convert" intent via conversion pipeline', async () => {
       process.env.GEMINI_API_KEY = 'test-mock-key';
       const mockJsonResponse = JSON.stringify({
-        intent: 'convert',
-        language: 'python',
-        solution: 'print("hello")',
+        success: true,
+        sourceLanguage: 'Java',
+        targetLanguage: 'Python',
+        convertedCode: 'print("hello")',
+        explanation: 'Converted Java System.out.println to Python print.',
+        notes: [],
+        warnings: [],
       });
 
       (provider as any).generateWithRetry.mockResolvedValue({
@@ -125,7 +128,8 @@ describe('GeminiProvider', () => {
       });
 
       expect(result.intent).toBe('convert');
-      expect(result.language).toBe('python');
+      expect(result.language).toBe('Python');
+      expect(result.convertedCode).toBe('print("hello")');
     });
 
     it('should correctly parse the "generate_tests" intent', async () => {

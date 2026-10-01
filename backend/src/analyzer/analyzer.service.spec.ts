@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AnalyzerService } from './analyzer.service';
+import { SyntaxValidatorService } from './syntax-validator.service';
 import { AI_PROVIDER, AIProvider } from '../ai/ai-provider.interface';
 import { BadRequestException } from '@nestjs/common';
 
@@ -9,12 +10,15 @@ describe('AnalyzerService', () => {
 
   const mockAiProvider = {
     analyzeCode: jest.fn(),
+    convertCode: jest.fn(),
+    processPrompt: jest.fn(),
   };
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AnalyzerService,
+        SyntaxValidatorService,
         { provide: AI_PROVIDER, useValue: mockAiProvider },
       ],
     }).compile();
@@ -47,6 +51,7 @@ describe('AnalyzerService', () => {
   describe('analyze', () => {
     it('should return AI analysis result', async () => {
       const mockResult = {
+        success: true,
         language: 'Python',
         status: 'bug_found' as const,
         bugs: [

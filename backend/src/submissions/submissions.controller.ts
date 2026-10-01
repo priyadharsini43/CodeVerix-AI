@@ -2,6 +2,7 @@ import { Controller, Post, Get, Body, Param, Query, UseGuards } from '@nestjs/co
 import { SubmissionsService } from './submissions.service';
 import { AnalyzeSubmissionDto } from './dto/analyze-submission.dto';
 import { UniversalPromptDto } from './dto/universal-prompt.dto';
+import { ConvertCodeDto } from './dto/convert-code.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser, UserPayload } from '../common/decorators/current-user.decorator';
 
@@ -16,6 +17,14 @@ export class SubmissionsController {
     @Body() dto: AnalyzeSubmissionDto,
   ) {
     return this.submissionsService.analyzeAndSave(user.userId, dto);
+  }
+
+  @Post('convert')
+  async convert(
+    @CurrentUser() user: UserPayload,
+    @Body() dto: ConvertCodeDto,
+  ) {
+    return this.submissionsService.convertCode(user.userId, dto);
   }
 
   @Post('prompt')

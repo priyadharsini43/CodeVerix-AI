@@ -1,6 +1,7 @@
 import { Injectable, Inject, BadRequestException } from '@nestjs/common';
-import { AI_PROVIDER, AIProvider, AnalysisResult, PromptResult } from '../ai/ai-provider.interface';
+import { AI_PROVIDER, AIProvider, AnalysisResult, ConversionResult, PromptResult } from '../ai/ai-provider.interface';
 import { SUPPORTED_LANGUAGES } from '../projects/dto/create-project.dto';
+import { SyntaxValidatorService } from './syntax-validator.service';
 
 const MAX_CODE_BYTES = 50 * 1024; // 50KB limit
 
@@ -22,6 +23,7 @@ export function normalizeLanguageName(lang: string): string {
 export class AnalyzerService {
   constructor(
     @Inject(AI_PROVIDER) private aiProvider: AIProvider,
+    private syntaxValidator: SyntaxValidatorService,
   ) {}
 
   validateCodeSubmission(language: string, sourceCode: string): string {
@@ -49,7 +51,57 @@ export class AnalyzerService {
 
   async analyze(language: string, sourceCode: string): Promise<AnalysisResult> {
     const normalizedLang = this.validateCodeSubmission(language, sourceCode);
-    return this.aiProvider.analyzeCode({ language: normalizedLang, sourceCode });
+    const syntaxResult = this.syntaxValidator.validateSyntax(normalizedLang, sourceCode);
+
+    const result = await this.aiProvider.analyzeCode({ language: normalizedLang, sourceCode });
+
+    if (!syntaxResult.isValid && syntaxResult.errors.length > 0 && result.status === 'no_bug_found') {
+      result.status = 'bug_found';
+      result.bugs.push({
+        line: 1,
+        type: 'syntax',
+        severity: 'high',
+        message: 'Compiler / Syntax validation error detected.',
+        explanation: syntaxResult.errors[0],
+      });
+    }
+
+    return result;
+  }
+
+  async convertCode(
+    sourceLanguage: string,
+    targetLanguage: string,
+    sourceCode: string,
+  ): Promise<ConversionResult> {
+    const normSource = this.validateCodeSubmission(sourceLanguage, sourceCode);
+    const normTarget = normalizeLanguageName(targetLanguage);
+
+    const isSupportedTarget = SUPPORTED_LANGUAGES.some(
+      (l) => l.toLowerCase() === normTarget.toLowerCase(),
+    );
+
+    if (!isSupportedTarget) {
+      throw new BadRequestException(
+        `Unsupported target language '${targetLanguage}'. Supported languages are: ${SUPPORTED_LANGUAGES.join(', ')}`,
+      );
+    }
+
+    const conversion = await this.aiProvider.convertCode({
+      sourceLanguage: normSource,
+      targetLanguage: normTarget,
+      sourceCode,
+    });
+
+    if (conversion.convertedCode) {
+      const syntaxCheck = this.syntaxValidator.validateSyntax(normTarget, conversion.convertedCode);
+      if (!syntaxCheck.isValid && syntaxCheck.errors.length > 0) {
+        if (!conversion.warnings) conversion.warnings = [];
+        conversion.warnings.push(`Syntax warning in converted code: ${syntaxCheck.errors[0]}`);
+      }
+    }
+
+    return conversion;
   }
 
   async processUniversalPrompt(prompt: string, language: string, sourceCode?: string): Promise<PromptResult> {
